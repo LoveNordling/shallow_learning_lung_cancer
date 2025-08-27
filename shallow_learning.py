@@ -12,12 +12,41 @@ from sklearn.svm import SVC
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.inspection import permutation_importance
-from scipy.stats import ttest_rel
+from scipy.stats import ttest_rel, shapiro, wilcoxon
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 # Toggle permutation importances
 PERMUTE_FEATURES = True
+
+def _p_one_sided(x, y, label, alpha=0.05):
+    """One-sided paired test for 'is x > y?':
+       - Shapiro on paired diffs
+       - If non-normal -> Wilcoxon (greater)
+       - Else -> paired t-test (greater)
+    """
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if x.shape != y.shape or x.size == 0:
+        return np.nan
+
+    diffs = x - y
+
+    # Shapiro on paired differences (relevant assumption for paired t-test)
+    try:
+        p_norm = shapiro(diffs).pvalue if 3 < diffs.size < 5000 else 1.0
+    except Exception:
+        p_norm = 1.0
+
+    if p_norm < alpha:
+        print(f"[Warning] Non-normal paired differences for {label} (Shapiro p={p_norm:.3g}); using Wilcoxon (one-sided).")
+        try:
+            return wilcoxon(diffs, alternative="greater", zero_method="wilcox").pvalue
+        except ValueError:
+            # All diffs zero or too few non-zero pairs – no evidence of improvement
+            return 1.0
+    else:
+        return ttest_rel(x, y, alternative="greater").pvalue
+
 
 def get_feature_importance(model, columns):
     if hasattr(model, 'coef_'):
@@ -26,7 +55,7 @@ def get_feature_importance(model, columns):
         return pd.DataFrame({'feature': columns, 'importance': model.feature_importances_})
     else:
         return pd.DataFrame({'feature': columns, 'importance': [np.nan]*len(columns)})
-
+    
 def plot_feature_importances(importances, feature_names, title, filename):
     sorted_idx = np.argsort(importances)[::-1]
     plt.figure(figsize=(10, 6))
@@ -86,7 +115,7 @@ model_registry = {
     "LogReg": init_logreg,
     "SVM": init_svm,
     "KNN": init_knn,
-    #"Random": lambda: RandomClassifier()
+    "Random": lambda: RandomClassifier()
 }
 
 # ---- Main ----
@@ -97,17 +126,17 @@ y = df[["ID", "label"]]
 
 column_names = X.columns.tolist()
 clinical_parameters = column_names[:6]
-morphologies = column_names[6:9]
+pleomorphism = column_names[6:9]
 densities = column_names[9:]
-part_names = {"clinical parameters": clinical_parameters, "morphologies": morphologies, "densities": densities}
+part_names = {"clinical parameters": clinical_parameters, "pleomorphism": pleomorphism, "densities": densities}
 
 name_combination_list = [
-    ["clinical parameters","morphologies","densities"],
-    ["clinical parameters","morphologies"],
+    ["clinical parameters","pleomorphism","densities"],
+    ["clinical parameters","pleomorphism"],
     ["clinical parameters","densities"],
-    ["morphologies","densities"],
+    ["pleomorphism","densities"],
     ["clinical parameters"],
-    ["morphologies"],
+    ["pleomorphism"],
     ["densities"]
 ]
 
@@ -148,7 +177,9 @@ for name_comb in name_combination_list:
         preds_by_id = {ID: [] for ID in df["ID"]}
         logits_by_id = {ID: [] for ID in df["ID"]}
         preds_logits = []
-
+        fi_per_split_rows = []   # coefficients (LogReg)
+        pi_per_split_rows = []   # permutation importance
+        
         for split in tqdm(range(num_splits), desc=f"{experiment_name}-{model_name}", leave=False):
             train_ids = pd.read_csv(os.path.join(split_folder, f"split_{split}_train_val.csv"))["ID"]
             test_ids = pd.read_csv(os.path.join(split_folder, f"split_{split}_test.csv"))["ID"]
@@ -213,10 +244,35 @@ for name_comb in name_combination_list:
             if model_name in ["LogReg"]:
                 fi = get_feature_importance(best_model, feature_list)
                 feature_importances.append(fi)
+                # After computing 'fi' (a DataFrame with columns ['feature','importance'])
+                for f, v in zip(fi["feature"].values, fi["importance"].values):
+                    fi_per_split_rows.append({
+                        "split": split,           # your fold/repeat index
+                        "feature": f,
+                        "importance": float(v)
+                    })
                 if PERMUTE_FEATURES:
-                    pi = permutation_importance(best_model, X_test_scaled, y_test["label"], n_repeats=10, random_state=42, n_jobs=-1)
+                    pi = permutation_importance(best_model, X_test_scaled, y_test["label"], n_repeats=10, random_state=42, n_jobs=-1)#, scoring="roc_auc")
                     permutation_importances.append(pi.importances_mean)
+                    # Save per-fold permutation importances (mean across repeats)
+                    for f, v in zip(feature_list, pi.importances_mean):
+                        pi_per_split_rows.append({
+                            "split": split,
+                            "feature": f,
+                            "importance": float(v)
+                        })
 
+        # Write raw per-fold explainability (only if collected)
+        if model_name == "LogReg" and len(fi_per_split_rows) > 0:
+            pd.DataFrame(fi_per_split_rows).to_csv(
+                f"plots/{experiment_name}_{model_name}_feature_importance_per_split.csv",
+                index=False
+            )
+        if len(pi_per_split_rows) > 0:
+            pd.DataFrame(pi_per_split_rows).to_csv(
+                f"plots/{experiment_name}_{model_name}_perm_importance_per_split.csv",
+                index=False
+            )
         # Aggregate results for results_dict
         results_dict["Experiment"].append(experiment_name)
         results_dict["Model"].append(model_name)
@@ -293,10 +349,123 @@ for key in all_acc:
     results_acc = all_acc[key]
     results_auc = all_auc[key]
     if clinical_acc is not None and len(results_acc) == len(clinical_acc):
-        _, p_value_acc = ttest_rel(results_acc, clinical_acc)
-        _, p_value_auc = ttest_rel(results_auc, clinical_auc)
+        #_, p_value_acc = ttest_rel(results_acc, clinical_acc)
+        #_, p_value_auc = ttest_rel(results_auc, clinical_auc)
+        p_value_acc = _p_one_sided(results_acc, clinical_acc,
+                                          f"{experiment_name} | {model_name} | Accuracy")
+        p_value_auc = _p_one_sided(results_auc, clinical_auc,
+                                          f"{experiment_name} | {model_name} | AUC")
+
+
         p_value_stats["experiment"].append(experiment_name)
         p_value_stats["model"].append(model_name)
         p_value_stats["Accuracy"].append(p_value_acc)
         p_value_stats["AUC"].append(p_value_auc)
 pd.DataFrame(p_value_stats).to_csv("p_values.csv", index=False)
+
+
+
+# ---- Compact, ordered results per model ----
+# Uses test-set metrics only, ordered for figures/tables, with human-readable names.
+
+# 1) Human-readable names and desired order (to match your plotting scripts)
+exp_fullname_map = {
+    "clinical parameters": "Clinical Parameters",
+    "densities": "Immune Cell Densities",
+    "pleomorphism": "Pleomorphism",
+    "clinical parameters_densities": "Clinical Parameters + Densities",
+    "clinical parameters_pleomorphism": "Clinical Parameters + Pleomorphism",
+    "pleomorphism_densities": "Densities + Pleomorphism",
+    "clinical parameters_pleomorphism_densities": "Clinical Parameters + Densities + Pleomorphism",
+}
+desired_order = [
+    "clinical parameters",
+    "densities",
+    "pleomorphism",
+    "clinical parameters_densities",
+    "clinical parameters_pleomorphism",
+    "pleomorphism_densities",
+    "clinical parameters_pleomorphism_densities",
+]
+
+# 2) Helpers
+def _fmt_mean_sem(arr):
+    arr = np.asarray(arr, dtype=float)
+    mean = np.mean(arr)
+    sem = np.std(arr, ddof=0) / np.sqrt(len(arr)) if len(arr) else np.nan
+    return f"{mean:.3f} ± {sem:.3f}"
+
+def _fmt_p(p):
+    if p is None or (isinstance(p, float) and np.isnan(p)):
+        return ""
+    return "<0.001" if p < 0.001 else f"{p:.3f}"
+
+# Convert the long 'results' table to a dict for quick lookups (means of other test metrics)
+_results_df = results  # from earlier in the script
+_results_idx = {(r["Experiment"], r["Model"]): r for _, r in _results_df.iterrows()}
+
+# 3) Build one compact CSV per model
+for model_name in model_registry.keys():
+    rows = []
+    for exp in desired_order:
+        # Skip rows that weren't computed (defensive)
+        if (exp, model_name) not in all_acc or (exp, model_name) not in all_auc:
+            continue
+
+        # Accuracy mean±SEM and paired t-test vs clinical baseline (same splits)
+        acc_vals = all_acc[(exp, model_name)]
+        acc_str = _fmt_mean_sem(acc_vals)
+
+        if exp == "clinical parameters":
+            p_acc = None
+        else:
+            base_acc = all_acc.get(("clinical parameters", model_name))
+            p_acc = None
+            if base_acc is not None and len(base_acc) == len(acc_vals):
+                #_, p_acc = ttest_rel(acc_vals, base_acc)
+                p_acc = _p_one_sided(acc_vals, base_acc,
+                                    f"{exp} | {model_name} | Accuracy")
+
+        # AUC mean±SEM and paired t-test vs clinical baseline
+        auc_vals = all_auc[(exp, model_name)]
+        auc_str = _fmt_mean_sem(auc_vals)
+
+        if exp == "clinical parameters":
+            p_auc = None
+        else:
+            base_auc = all_auc.get(("clinical parameters", model_name))
+            p_auc = None
+            if base_auc is not None and len(base_auc) == len(auc_vals):
+                #_, p_auc = ttest_rel(auc_vals, base_auc)
+                p_auc = _p_one_sided(auc_vals, base_auc,
+                                    f"{exp} | {model_name} | AUC")
+
+        # Sens/Spec/NPV/PPV means (3 decimals)
+        # (We stored these as means in 'results' earlier)
+        rr = _results_idx.get((exp, model_name))
+        sens = f"{rr['Test sensitivity']:.3f}" if rr is not None else ""
+        spec = f"{rr['Test specificity']:.3f}" if rr is not None else ""
+        npv  = f"{rr['Test NPV']:.3f}"         if rr is not None else ""
+        ppv  = f"{rr['Test PPV']:.3f}"         if rr is not None else ""
+
+        # Assemble row
+        rows.append({
+            "Experiment": exp_fullname_map.get(exp, exp),
+            "Accuracy": f"{acc_str} ({_fmt_p(p_acc)})",#acc_str,            # mean ± SEM
+            #"p-value": _fmt_p(p_acc),       # vs Clinical Parameters
+            "AUC": f"{auc_str} ({_fmt_p(p_auc)})",#auc_str,                 # mean ± SEM
+            #"p-value.1": _fmt_p(p_auc),     # vs Clinical Parameters
+            "Sensitivity": sens,
+            "Specificity": spec,
+            "NPV": npv,
+            "PPV": ppv,
+        })
+
+    # Ensure the written order matches desired_order
+    compact_cols = ["Experiment", "Accuracy", "p-value", "AUC", "p-value.1", "Sensitivity", "Specificity", "NPV", "PPV"]
+    compact_df = pd.DataFrame(rows, columns=compact_cols)
+
+    # Save per model
+    compact_out = f"results_shallow_learning2_compact_{model_name}.csv"
+    compact_df.to_csv(compact_out, index=False)
+
